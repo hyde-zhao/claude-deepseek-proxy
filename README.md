@@ -1,122 +1,122 @@
 # ClaudeCode-DeepSeek-Proxy
 
-A local HTTPS proxy that fixes the thinking block incompatibility between **Claude Code** and **DeepSeek V4 Pro** (Anthropic-compatible API).
+一个本地 HTTPS proxy，解决 **Claude Code + DeepSeek V4 Pro** 的 thinking block 兼容性问题。
 
-## The Problem
+## 啥问题？
 
-When using DeepSeek V4 Pro through Claude Code with thinking mode enabled:
+用 DeepSeek V4 Pro 跑 Claude Code，开着 thinking 模式，多轮对话直接炸：
 
-1. **Multi-turn 400 error**: DeepSeek returns `thinking` blocks in responses, but Claude Code doesn't pass them back in subsequent requests. DeepSeek requires them: `"content[].thinking in the thinking mode must be passed back to the API"`
+1. **400: content[].thinking must be passed back** — DeepSeek 返回了 thinking 块，Claude Code 下一轮没传回去，DeepSeek 就报错了。本质是 Claude Code 的 bug，它不是给 DeepSeek 设计的。
 
-2. **Can't disable thinking**: When `reasoning_effort` is set (Claude Code's `effortLevel`), DeepSeek requires thinking to be enabled: `"thinking options type cannot be disabled when reasoning_effort is set"`
+2. **400: thinking cannot be disabled when reasoning_effort is set** — 你说那我关 thinking 不行吗？不行。Claude Code 的 `effortLevel` 会发 `reasoning_effort`，DeepSeek 规定设了 reasoning_effort 就必须开 thinking。
 
-This is essentially a compatibility bug in Claude Code — it wasn't designed for DeepSeek's thinking block behavior.
+开也不行关也不行，卡死了。这个 proxy 就是来解决这个的。
 
-## How It Works
+## 怎么解决的
 
 ```
 Claude Code  ──HTTPS──▶  Proxy (127.0.0.1:9191)  ──HTTPS──▶  DeepSeek API
                            │
-                           ├─ Request:  Inject missing thinking blocks into
-                           │            assistant messages (from cache)
-                           │            Ensure thinking: enabled
+                           ├─ 请求：assistant 消息缺 thinking 块？
+                           │         从缓存里补回去！
+                           │         确保 thinking: enabled
                            │
-                           └─ Response: Cache thinking blocks for future use
-                                        Pass through as-is
+                           └─ 响应：把 thinking 块缓存下来
+                                     原样透传给 Claude Code
 ```
 
-| Direction | Action | Why |
-|-----------|--------|-----|
-| **Request** | Inject cached `thinking` blocks into assistant messages | DeepSeek requires them, Claude Code doesn't send them |
-| **Request** | Ensure `thinking: enabled` | Required when `reasoning_effort` is set |
-| **Request** | Convert `redacted_thinking` → `thinking` | DeepSeek only accepts `thinking` type |
-| **Response** | Cache thinking blocks by text hash | For future request injection |
-| **Response** | Pass thinking blocks through | Claude Code stores them normally |
+| 方向 | 干了啥 | 为啥 |
+|------|--------|------|
+| Request | 缺 thinking 块的 assistant 消息，从缓存补回去 | DeepSeek 要求必须传，Claude Code 不传 |
+| Request | 确保 `thinking: enabled` | reasoning_effort 要求的 |
+| Request | `redacted_thinking` 转回 `thinking` | DeepSeek 只认 `thinking` |
+| Response | 缓存 thinking 块 | 下次请求要用 |
+| Response | 原样透传 | Claude Code 正常存就行 |
 
-## Quick Start
+简单说就是：**Claude Code 不传 thinking 块？没关系，proxy 帮你记着，每次请求自动补上。**
 
-### Prerequisites
+## 快速开始
 
-- Python 3.8+
-- DeepSeek API key
-
-### Install
+### 装依赖
 
 ```bash
 pip install cryptography
+```
 
-# Clone
-git clone https://github.com/YOUR_USERNAME/claude-deepseek-proxy.git
+### clone & 安装证书
+
+```bash
+git clone https://github.com/2138299057-lang/claude-deepseek-proxy.git
 cd claude-deepseek-proxy
 
-# Generate certificate & install to system trust store (one-time)
+# 生成证书 + 装到系统信任区（只需跑一次）
 python claude_deepseek_proxy.py --install
 ```
 
-### Run
+### 启动 proxy
 
 ```bash
-# Start the proxy (default port 9191)
+# 默认 9191 端口
 python claude_deepseek_proxy.py
 
-# Or specify a port
+# 或者指定端口
 python claude_deepseek_proxy.py 8443
 ```
 
-### Configure Claude Code
+### 配置 Claude Code
 
-Edit `~/.claude/settings.json`:
+编辑 `~/.claude/settings.json`：
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "https://127.0.0.1:9191",
-    "ANTHROPIC_AUTH_TOKEN": "your-deepseek-api-key",
+    "ANTHROPIC_AUTH_TOKEN": "你的-deepseek-api-key",
     "ANTHROPIC_MODEL": "DeepSeek-V4-pro[1m]"
   },
   "alwaysThinkingEnabled": true
 }
 ```
 
-Restart Claude Code and you're done!
+重启 Claude Code，搞定。
 
-### Uninstall
+### 卸载
 
 ```bash
 python claude_deepseek_proxy.py --uninstall
 ```
 
-This removes the CA certificate from the system trust store and deletes all generated cert files.
+删证书、清文件，干干净净。
 
-## Environment Variables
+## 环境变量
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEEPSEEK_API_URL` | `https://api.deepseek.com/anthropic` | Upstream API endpoint |
-| `THINKING_BUDGET` | `10000` | Token budget for thinking mode |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEEPSEEK_API_URL` | `https://api.deepseek.com/anthropic` | 上游 API 地址 |
+| `THINKING_BUDGET` | `10000` | thinking token 预算 |
 
-## How the Certificate Works
+## 关于证书
 
-The proxy generates a self-signed CA certificate and installs it to your system trust store. This allows Claude Code to connect via HTTPS without SSL errors. The CA signs a server certificate for `127.0.0.1` with proper `IPAddress` SAN (not `DNSName` — a common pitfall that causes hostname mismatch errors).
+proxy 会生成一个自签名 CA 证书装到你系统信任区，这样 Claude Code 走 HTTPS 就不会报 SSL 错误。CA 签发的 server 证书给 `127.0.0.1` 用，SAN 用的是 `IPAddress`（不是 `DNSName`，用 DNSName 会 hostname mismatch，这是个坑）。
 
-## Troubleshooting
+## 踩坑记录
 
 ### SSL certificate hostname mismatch
 
-Make sure the certificate was generated with `IPAddress` SAN, not `DNSName`. If you see this error, regenerate:
+证书 SAN 里 IP 地址必须用 `IPAddress`，不能用 `DNSName`。遇到这个就重新生成：
 
 ```bash
 python claude_deepseek_proxy.py --uninstall
 python claude_deepseek_proxy.py --install
 ```
 
-### Proxy not receiving requests
+### Proxy 收不到请求
 
-Claude Code only accepts `https://` endpoints. Make sure `ANTHROPIC_BASE_URL` starts with `https://127.0.0.1:PORT`, not `http://`.
+Claude Code 只走 `https://`，`http://` 的 endpoint 它不理。确保 `ANTHROPIC_BASE_URL` 是 `https://127.0.0.1:PORT`。
 
 ### 400: thinking cannot be disabled when reasoning_effort is set
 
-This is exactly what the proxy fixes. Make sure the proxy is running and `ANTHROPIC_BASE_URL` points to it.
+这正是这个 proxy 解决的问题。确保 proxy 在跑，`ANTHROPIC_BASE_URL` 指向它。
 
 ## License
 
