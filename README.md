@@ -4,9 +4,9 @@
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square)
 ![License](https://img.shields.io/github/license/HiChat-fog/claude-deepseek-proxy?style=flat-square)
 
-A local HTTPS proxy that fixes **thinking block incompatibility** between Claude Code and DeepSeek V4 Pro.
+A local HTTPS proxy that fixes **thinking block incompatibility** between Claude Code and DeepSeek V4 Pro. Crash-resistant with auto-restart.
 
-一个本地 HTTPS proxy，解决 **Claude Code + DeepSeek V4 Pro** 的 thinking block 兼容性问题。
+一个本地 HTTPS proxy，解决 **Claude Code + DeepSeek V4 Pro** 的 thinking block 兼容性问题。自带防崩+自动重启，稳得很。
 
 ---
 
@@ -57,6 +57,37 @@ TL;DR: **Claude Code doesn't pass back thinking blocks? No worries — the proxy
 
 ---
 
+## Crash Resistance / 防崩机制
+
+Nobody wants their proxy dying silently in the middle of a session. This proxy has two layers of protection:
+
+谁也不想 proxy 跑着跑着静悄悄挂了。这个 proxy 有两层防护：
+
+1. **Request-level error handling / 请求级防崩** — Each request is wrapped in a try/except. If something goes wrong with a single request (bad JSON, timeout, weird API response), the proxy returns a 502 error for that request but **keeps running**. No more one bad request killing the whole server.
+
+   每个请求都包了 try/except。单个请求出了问题（JSON 解析失败、超时、API 返回奇怪的东西），proxy 只会返回 502，**不会崩**。不会再出现一个请求搞死整个 server 的情况。
+
+2. **Auto-restart loop / 进程级自愈** — If the server somehow crashes entirely, it automatically restarts within 3 seconds. Port already in use? It retries every 5 seconds. Only `Ctrl+C` will actually stop it.
+
+   如果 server 还是不幸崩了，3 秒内自动重启。端口被占了？每 5 秒重试。只有 `Ctrl+C` 才能真正停掉它。
+
+### Auto-start on boot / 开机自启 (Windows)
+
+Put this VBS file in your Startup folder (`Win+R` → `shell:startup`):
+
+把下面的 VBS 文件放到启动文件夹（`Win+R` → `shell:startup`）：
+
+```vbs
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "python ""C:\path\to\claude_deepseek_proxy.py"" 9191", 0, False
+```
+
+This launches the proxy silently on login. Set it and forget it.
+
+开机自动后台启动 proxy，设一次就不用管了。
+
+---
+
 ## Quick Start / 快速开始
 
 ### Install dependencies / 装依赖
@@ -85,6 +116,10 @@ python claude_deepseek_proxy.py
 # Or specify a port / 或者指定端口
 python claude_deepseek_proxy.py 8443
 ```
+
+The proxy auto-restarts on crash. If you see `Auto-restart enabled` in the log, you're covered.
+
+proxy 崩了会自动重启。日志里看到 `Auto-restart enabled` 就说明防护已开启。
 
 ### Configure Claude Code / 配置 Claude Code
 
@@ -158,6 +193,12 @@ Claude Code 只走 `https://`，`http://` 的 endpoint 它不理。确保 `ANTHR
 This is exactly what the proxy fixes. Make sure the proxy is running and `ANTHROPIC_BASE_URL` points to it.
 
 这正是这个 proxy 解决的问题。确保 proxy 在跑，`ANTHROPIC_BASE_URL` 指向它。
+
+### ConnectionRefused / 连接被拒绝
+
+The proxy process might have died. With the auto-restart feature this should be rare, but if it happens, just restart it manually. Also make sure the port isn't blocked by a firewall.
+
+proxy 进程可能挂了。有自动重启功能后应该很少出现，但如果碰到了手动重启就行。另外确认端口没被防火墙拦。
 
 ---
 
