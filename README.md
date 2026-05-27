@@ -1,5 +1,9 @@
 # ClaudeCode-DeepSeek-Proxy
 
+![CI](https://img.shields.io/github/actions/workflow/status/HiChat-fog/claude-deepseek-proxy/ci.yml?branch=master&style=flat-square&label=CI)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square)
+![License](https://img.shields.io/github/license/HiChat-fog/claude-deepseek-proxy?style=flat-square)
+
 一个本地 HTTPS proxy，解决 **Claude Code + DeepSeek V4 Pro** 的 thinking block 兼容性问题。
 
 ## 啥问题？
