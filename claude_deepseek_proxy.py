@@ -19,9 +19,18 @@ Solution:
 One-time setup: run with --install to trust the self-signed cert.
 """
 
-import json, ssl, sys, os, time, subprocess, platform, base64, hashlib
+import base64
+import hashlib
+import json
+import os
+import platform
+import ssl
+import subprocess
+import sys
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.request, urllib.error
+import urllib.error
+import urllib.request
 
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/anthropic")
 CERT_DIR = os.path.expanduser("~/.claude-deepseek-proxy")
@@ -246,7 +255,8 @@ def generate_cert():
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    import datetime, ipaddress
+    import datetime
+    import ipaddress
 
     # CA key + cert
     ca_key = rsa.generate_private_key(65537, 2048)
@@ -309,7 +319,6 @@ def generate_cert():
 def uninstall_cert():
     """Remove CA cert from system trust store and delete cert files."""
     system = platform.system()
-    ca_path = os.path.join(CERT_DIR, "ca.pem")
 
     if system == "Windows":
         subprocess.run(
@@ -374,7 +383,7 @@ def main():
 
     print(f"[proxy] https://127.0.0.1:{port} -> {DEEPSEEK_URL}", flush=True)
     print(f"[proxy] Set ANTHROPIC_BASE_URL=https://127.0.0.1:{port}", flush=True)
-    print(f"[proxy] Strategy: cache thinking from responses, inject into requests when missing", flush=True)
+    print("[proxy] Strategy: cache thinking from responses, inject into requests when missing", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
