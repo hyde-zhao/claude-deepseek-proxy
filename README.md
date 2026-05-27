@@ -1,12 +1,12 @@
-# ClaudeCode-DeepSeek-Proxy
+# 🧠 Claude Code + DeepSeek Thinking Mode Proxy
 
 ![CI](https://img.shields.io/github/actions/workflow/status/HiChat-fog/claude-deepseek-proxy/ci.yml?branch=master&style=flat-square&label=CI)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square)
 ![License](https://img.shields.io/github/license/HiChat-fog/claude-deepseek-proxy?style=flat-square)
 
-A local HTTPS proxy that fixes **thinking block incompatibility** between Claude Code and DeepSeek V4 Pro. Crash-resistant with auto-restart.
+**Enable thinking mode for Claude Code with DeepSeek V4 Pro** — a crash-resistant HTTPS proxy that fixes the "thinking block must be passed back" error. Set it up once, forget about it.
 
-一个本地 HTTPS proxy，解决 **Claude Code + DeepSeek V4 Pro** 的 thinking block 兼容性问题。自带防崩+自动重启，稳得很。
+**让 Claude Code + DeepSeek V4 Pro 的 thinking 模式真正能用** — 防崩+自动重启的 HTTPS proxy，解决 "thinking block must be passed back" 报错。设一次，再也不用管。
 
 ---
 
