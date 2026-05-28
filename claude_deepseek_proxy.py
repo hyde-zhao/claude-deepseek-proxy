@@ -15,6 +15,10 @@ Solution:
   - Ensure thinking: enabled is always set (required by reasoning_effort).
   - Convert redacted_thinking blocks back to thinking blocks for DeepSeek
     (DeepSeek only accepts `thinking`, not `redacted_thinking`).
+  - Enforce disable_parallel_tool_use: When a tool has disable_parallel_tool_use
+    set to true, force the model to return only one tool_use at a time.
+    DeepSeek silently ignores this flag, which can cause execution order issues
+    in Claude Code (e.g., parallel file writes corrupting each other).
   - Auto-restart: Crash-resistant with auto-recovery loop.
 
 One-time setup: run with --install to trust the self-signed cert.
@@ -49,6 +53,13 @@ THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "10000"))
 # when Claude Code doesn't pass them back. Keyed by a hash of the text response.
 _thinking_store = {}  # {hash_of_text: [thinking_blocks]}
 
+# --- Parallel tool use tracking ---
+# When any tool in the request has disable_parallel_tool_use=true, we need
+# to enforce serial tool calls. DeepSeek silently ignores this flag.
+# We track which request IDs have this constraint so we can strip extra
+# tool_use blocks from the response.
+_parallel_disabled = False
+
 
 def _hash_text(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:16]
@@ -62,7 +73,20 @@ def patch_request(data):
        inject cached thinking blocks so DeepSeek doesn't 400.
     3. If Claude Code passed back redacted_thinking blocks,
        convert them to thinking blocks (DeepSeek only accepts thinking).
+    4. Detect disable_parallel_tool_use flag so we can enforce it in
+       the response (DeepSeek silently ignores this flag).
     """
+    global _parallel_disabled
+
+    # --- Detect disable_parallel_tool_use ---
+    # Check if any tool definition has disable_parallel_tool_use=true
+    _parallel_disabled = False
+    tools = data.get("tools", [])
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("disable_parallel_tool_use", False):
+                _parallel_disabled = True
+                break
     # --- Fix thinking mode ---
     has_reasoning = "reasoning_effort" in data
     thinking = data.get("thinking", {})
@@ -151,14 +175,43 @@ def patch_request(data):
 def patch_response(data):
     """Fix incoming response from DeepSeek.
 
-    Cache thinking blocks for future request injection.
-    Keep thinking blocks as-is in the response so Claude Code can store them.
-    If Claude Code passes them back, great. If not, we inject from cache.
+    1. Cache thinking blocks for future request injection.
+       Keep thinking blocks as-is in the response so Claude Code can store them.
+       If Claude Code passes them back, great. If not, we inject from cache.
+    2. Enforce disable_parallel_tool_use: If the request had this flag set
+       and DeepSeek returned multiple tool_use blocks, keep only the first one.
+       DeepSeek silently ignores this flag, so we enforce it on our side.
     """
+    global _parallel_disabled
+
     content = data.get("content", [])
     if not isinstance(content, list):
         return data, False
 
+    # --- Enforce disable_parallel_tool_use ---
+    if _parallel_disabled:
+        tool_use_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if len(tool_use_blocks) > 1:
+            # Keep only the first tool_use block, remove the rest
+            first_tool = True
+            new_content = []
+            removed = 0
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    if first_tool:
+                        new_content.append(b)
+                        first_tool = False
+                    else:
+                        removed += 1
+                else:
+                    new_content.append(b)
+            content = new_content
+            data["content"] = content
+            if removed > 0:
+                print(f"[{time.strftime('%H:%M:%S')}] PARALLEL-FIX: Removed {removed} extra tool_use blocks (disable_parallel_tool_use was set)", flush=True)
+        _parallel_disabled = False  # Reset for next request
+
+    # --- Cache thinking blocks ---
     thinking_blocks = [
         b for b in content
         if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")

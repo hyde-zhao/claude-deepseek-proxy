@@ -38,9 +38,13 @@ Claude Code  ──HTTPS──▶  Proxy (127.0.0.1:9191)  ──HTTPS──▶ 
                            ├─ Request: assistant msg missing thinking blocks?
                            │           Inject them from cache!
                            │           Ensure thinking: enabled
+                           │           Detect disable_parallel_tool_use
                            │
-                           └─ Response: cache thinking blocks
-                                         Pass through to Claude Code as-is
+                           ├─ Response: cache thinking blocks
+                           │            Pass through to Claude Code as-is
+                           │            Enforce serial tool calls if requested
+                           │
+                           └─ Crash-proof: try/catch per request + auto-restart
 ```
 
 | Direction | What it does | Why |
@@ -48,12 +52,14 @@ Claude Code  ──HTTPS──▶  Proxy (127.0.0.1:9191)  ──HTTPS──▶ 
 | Request | Inject cached thinking blocks into assistant messages that are missing them | DeepSeek requires them, Claude Code doesn't send them |
 | Request | Ensure `thinking: enabled` | Required by reasoning_effort |
 | Request | Convert `redacted_thinking` back to `thinking` | DeepSeek only accepts `thinking` type |
+| Request | Detect `disable_parallel_tool_use` flag in tools | DeepSeek silently ignores this flag |
 | Response | Cache thinking blocks | Needed for future request injection |
+| Response | Strip extra tool_use blocks if `disable_parallel_tool_use` was set | DeepSeek ignores the flag, we enforce it |
 | Response | Pass through as-is | Claude Code stores them normally |
 
-TL;DR: **Claude Code doesn't pass back thinking blocks? No worries — the proxy remembers them and auto-injects every request.**
+TL;DR: **Claude Code doesn't pass back thinking blocks? No worries — the proxy remembers them and auto-injects every request. DeepSeek ignores `disable_parallel_tool_use`? The proxy enforces it.**
 
-简单说就是：**Claude Code 不传 thinking 块？没关系，proxy 帮你记着，每次请求自动补上。**
+简单说就是：**Claude Code 不传 thinking 块？没关系，proxy 帮你记着，每次请求自动补上。DeepSeek 忽略 `disable_parallel_tool_use`？proxy 帮你强制执行。**
 
 ---
 
@@ -166,6 +172,50 @@ Removes the CA cert from trust store and deletes cert files. Clean exit.
 The proxy generates a self-signed CA certificate and installs it to your system trust store, so Claude Code won't complain about SSL errors over HTTPS. The CA-issued server cert is for `127.0.0.1`, using `IPAddress` in SAN (not `DNSName` — using DNSName for an IP causes hostname mismatch, that's a gotcha).
 
 proxy 会生成一个自签名 CA 证书装到你系统信任区，这样 Claude Code 走 HTTPS 就不会报 SSL 错误。CA 签发的 server 证书给 `127.0.0.1` 用，SAN 用的是 `IPAddress`（不是 `DNSName`，用 DNSName 会 hostname mismatch，这是个坑）。
+
+---
+
+## DeepSeek Anthropic API Compatibility Report / 兼容性清单
+
+We systematically tested DeepSeek's Anthropic-compatible endpoint against the real Anthropic API spec. Here's what we found — including issues that few people in the community have documented.
+
+我们系统性地测试了 DeepSeek Anthropic 兼容端点与真实 Anthropic API 规范的差异。以下是我们发现的问题——包括社区中少有人记录的。
+
+### ✅ Fixed by this proxy / 本 proxy 已修复
+
+| # | Issue / 问题 | Severity | Status |
+|---|---|---|---|
+| 1 | **`thinking` block must be passed back** — DeepSeek 400 if missing in multi-turn | 🔴 Critical | ✅ Fixed — cached + injected |
+| 2 | **`redacted_thinking` rejected** — DeepSeek doesn't accept this type | 🟠 High | ✅ Fixed — converted to `thinking` |
+| 3 | **`disable_parallel_tool_use` ignored** — DeepSeek returns multiple tool_calls even when tools request serial execution | 🟠 High | ✅ Fixed — proxy strips extra tool_use blocks |
+
+### ⚠️ Known limitations (not fixable by proxy) / 已知限制（proxy 无法修复）
+
+| # | Issue / 问题 | Severity | Impact / 影响 |
+|---|---|---|---|
+| 4 | **`cache_control` silently ignored** — `cache_read_input_tokens` always returns 0 | 🔴 Critical | Every request reprocesses the entire system prompt from scratch. Combined with Claude Code's billing header, this can cause **~10x cost increase**. Workaround: set `CLAUDE_CODE_ATTRIBUTION_HEADER=false` |
+| 5 | **`thinking.budget_tokens` ignored** — `--effort max` has no effect | 🟠 High | Thinking depth is always the same regardless of budget. `--effort` is effectively useless with DeepSeek |
+| 6 | **`disable_parallel_tool_use` ignored** (original issue) | 🟠 High | Can cause file operation order issues in Claude Code (parallel writes corrupting each other). Proxy now enforces this server-side |
+| 7 | **`is_error` in `tool_result` silently ignored** | 🟡 Medium | DeepSeek treats error tool results as successful. If a tool returns `is_error: true` with empty content, the model won't know it failed. In practice, most errors include descriptive text so the model can infer failure from content |
+| 8 | **`thinking.type=adaptive` silently downgraded** — no error, but behaves as `enabled` | 🟡 Low | No 400 error, but behavior differs from native Anthropic API |
+| 9 | **Model name mapping** — `claude-opus-*` → `deepseek-v4-pro`, `claude-sonnet-*`/`claude-haiku-*` → `deepseek-v4-flash` | 🟡 Medium | Claude Code's SubAgent may expect a cheap model (haiku) but gets flash. Users may not notice the model difference |
+
+### 📊 Test methodology / 测试方法
+
+All findings were verified by sending real API requests to `https://api.deepseek.com/anthropic/v1/messages` and comparing behavior against the Anthropic API specification. Tests included:
+
+- `is_error: true` with empty content vs. descriptive content
+- `disable_parallel_tool_use: true` with multi-tool prompts
+- `thinking.type: adaptive` vs `enabled`
+- `budget_tokens` from 100 to 50000
+- `cache_control` breakpoints in system prompts
+- Model name resolution for `claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`
+
+### 💡 Why isn't this a "security vulnerability"? / 为什么这不是"安全漏洞"？
+
+These are **API protocol compatibility defects**, not security vulnerabilities. They don't leak data, bypass access controls, or allow privilege escalation. However, they can cause **silent logic errors** — the most dangerous kind, because the user gets wrong results without any error message.
+
+这些都是 **API 协议兼容性缺陷**，不是安全漏洞。不会泄露数据、不会绕过权限。但它们会导致**静默逻辑错误**——最危险的那种，因为用户拿到错误结果却看不到任何报错。
 
 ---
 
