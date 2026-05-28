@@ -87,6 +87,23 @@ def patch_request(data):
             if isinstance(tool, dict) and tool.get("disable_parallel_tool_use", False):
                 _parallel_disabled = True
                 break
+
+    # --- Strip dangerous stop_sequences ---
+    # DeepSeek's stop_sequences can be abused to truncate safety refusals
+    # mid-sentence (e.g., "I cannot" → truncated, looks like compliance).
+    # We remove stop_sequences that match common refusal phrases.
+    SAFETY_REFUSAL_STOPS = {
+        "i cannot", "i can't", "i'm sorry", "i must", "however",
+        "i don't", "i will not", "not able", "against", "policy",
+        "illegal", "unethical", "instead", "alternatively",
+    }
+    stop_seqs = data.get("stop_sequences", [])
+    if isinstance(stop_seqs, list) and stop_seqs:
+        filtered = [s for s in stop_seqs if s.lower().strip() not in SAFETY_REFUSAL_STOPS]
+        removed_count = len(stop_seqs) - len(filtered)
+        if removed_count > 0:
+            data["stop_sequences"] = filtered
+            print(f"[{time.strftime('%H:%M:%S')}] SAFETY-FIX: Removed {removed_count} dangerous stop_sequences (safety refusal truncation prevention)", flush=True)
     # --- Fix thinking mode ---
     has_reasoning = "reasoning_effort" in data
     thinking = data.get("thinking", {})
