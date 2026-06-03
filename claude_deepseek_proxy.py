@@ -1,12 +1,15 @@
 """
 ClaudeCode-DeepSeek-Proxy
 Fixes thinking block incompatibility between Claude Code + DeepSeek V4 Pro.
+Supports SSE streaming to prevent client-side timeouts during long thinking.
 
 Problem:
   DeepSeek V4 Pro returns thinking blocks in responses. In multi-turn
   conversations, Claude Code doesn't pass them back, causing 400 errors:
   "content[].thinking in the thinking mode must be passed back to the API"
   Also, when reasoning_effort is set, thinking cannot be disabled.
+  Additionally, without SSE streaming, Claude Code times out during long
+  thinking sessions (30-120s), causing mid-work disconnections.
 
 Solution:
   - Response: Cache thinking blocks from DeepSeek responses.
@@ -19,6 +22,8 @@ Solution:
     set to true, force the model to return only one tool_use at a time.
     DeepSeek silently ignores this flag, which can cause execution order issues
     in Claude Code (e.g., parallel file writes corrupting each other).
+  - SSE streaming: Forward SSE events from DeepSeek to Claude Code as they
+    arrive, preventing client-side timeouts during long thinking sessions.
   - Auto-restart: Crash-resistant with auto-recovery loop.
 
 One-time setup: run with --install to trust the self-signed cert.
@@ -26,6 +31,7 @@ One-time setup: run with --install to trust the self-signed cert.
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -34,6 +40,7 @@ import subprocess
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 import urllib.error
 import urllib.request
 
@@ -46,7 +53,7 @@ FORWARD_HEADERS = {
     "anthropic-version", "anthropic-beta",
 }
 
-THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "10000"))
+THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "4000"))
 
 # --- Thinking block store ---
 # We store thinking blocks from responses and inject them back into requests
@@ -284,8 +291,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             print(f"[{time.strftime('%H:%M:%S')}] REQ parse error: {e}", flush=True)
 
         headers = {k: v for k, v in self.headers.items() if k.lower() in FORWARD_HEADERS}
-        from urllib.parse import urlparse
         headers["Host"] = urlparse(DEEPSEEK_URL).hostname
+
+        # --- Streaming detection ---
+        # Claude Code sends stream=true by default. We MUST support SSE streaming
+        # to avoid client-side timeouts during long thinking sessions.
+        # Force stream=true for messages endpoints even if Claude Code didn't set it,
+        # to prevent the old buffered path from causing timeouts on large contexts.
+        is_stream = (isinstance(data, dict) and
+                     (data.get("stream", False) or
+                      self.path.rstrip("/").endswith("/messages")))
+
+        if is_stream:
+            self._handle_stream(body, headers)
+            return
 
         req = urllib.request.Request(DEEPSEEK_URL + self.path, data=body,
                                       headers=headers, method="POST")
@@ -320,6 +339,118 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(e.code)
             self.end_headers()
             self.wfile.write(err)
+
+    def _handle_stream(self, body, forward_headers):
+        """Raw pipe: forward SSE bytes from DeepSeek to Claude Code.
+
+        Simpler is more reliable. We read raw chunks from DeepSeek's SSE
+        stream and forward them immediately to Claude Code. No event parsing,
+        no line-by-line processing — just a fast byte pipe.
+
+        Thinking blocks are cached after the stream completes by scanning
+        the accumulated raw data.
+        """
+        parsed = urlparse(DEEPSEEK_URL + self.path)
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parsed.hostname, parsed.port or 443, timeout=300)
+        else:
+            conn = http.client.HTTPConnection(
+                parsed.hostname, parsed.port or 80, timeout=300)
+
+        try:
+            conn.request("POST", parsed.path, body=body, headers=forward_headers)
+            resp = conn.getresponse()
+
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] STREAM status={resp.status}", flush=True)
+
+            # --- Error response ---
+            if resp.status != 200:
+                err_body = resp.read()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err_body)))
+                self.end_headers()
+                self.wfile.write(err_body)
+                self.wfile.flush()
+                return
+
+            # --- SSE streaming response ---
+            resp_headers = {}
+            for k, v in resp.getheaders():
+                resp_headers[k.lower()] = v
+
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             resp_headers.get("content-type", "text/event-stream"))
+            self.send_header("Cache-Control", "no-cache")
+            self.close_connection = True
+            self.end_headers()
+
+            # Raw byte pipe: read chunks and forward immediately.
+            # No SSE parsing — just pass bytes through.
+            accumulated = bytearray()
+            chunk_total = 0
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                accumulated.extend(chunk)
+                chunk_total += 1
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+            self.wfile.flush()
+
+            # --- Post-stream: cache thinking blocks ---
+            if accumulated:
+                self._cache_thinking_from_bytes(bytes(accumulated), ts)
+
+            conn.close()
+            print(f"[{ts}] STREAM done {len(accumulated)}b {chunk_total} chunks", flush=True)
+
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] STREAM broke: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _cache_thinking_from_bytes(self, raw_bytes, ts):
+        """Scan raw SSE bytes for thinking blocks and cache them."""
+        global _parallel_disabled
+        text = raw_bytes.decode("utf-8", errors="replace")
+        thinking_blocks = []
+        text_parts = []
+
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("data: "):
+                continue
+            try:
+                event = json.loads(stripped[6:])
+                etype = event.get("type", "")
+                if etype == "content_block_start":
+                    cb = event.get("content_block", {})
+                    if isinstance(cb, dict) and cb.get("type") in (
+                            "thinking", "redacted_thinking"):
+                        thinking_blocks.append(cb)
+                elif etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        text_parts.append(delta.get("text", ""))
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        if thinking_blocks and text_parts:
+            text_hash = _hash_text("".join(text_parts))
+            _thinking_store[text_hash] = thinking_blocks
+            print(f"[{ts}] STREAM cached {len(thinking_blocks)} thinking "
+                  f"(hash={text_hash})", flush=True)
+
+        _parallel_disabled = False
 
     do_POST = _forward
     do_PATCH = _forward
