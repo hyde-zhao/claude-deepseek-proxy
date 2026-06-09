@@ -1,7 +1,7 @@
 """
 HTTP (non-SSL) version of the proxy.
-Eliminates SSL deadlock entirely — the root cause of all instability.
-Claude Code connects via HTTP, proxy forwards to DeepSeek via HTTPS.
+Eliminates local SSL deadlock entirely.
+Claude Code connects via HTTP, proxy forwards to the configured upstream.
 """
 import base64
 import hashlib
@@ -13,6 +13,34 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+
+def load_dotenv(path: str = ".env"):
+    """Load environment variables from a .env file without external deps.
+
+    Existing OS environment variables are kept and take precedence.
+    Supported lines:
+      KEY=value
+      KEY="value"
+      KEY='value'
+    Lines starting with # are ignored.
+    """
+    dotenv_path = os.path.abspath(path)
+    if not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_dotenv()
+
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/anthropic")
 THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "4000"))
 
@@ -23,6 +51,9 @@ FORWARD_HEADERS = {
 
 _thinking_store = {}
 _parallel_disabled = False
+
+def _upstream_url(path):
+    return DEEPSEEK_URL.rstrip("/") + path
 
 def _hash_text(text):
     return hashlib.md5(text.encode()).hexdigest()[:16]
@@ -37,14 +68,10 @@ def patch_request(data):
                 _parallel_disabled = True
                 break
 
-    has_reasoning = "reasoning_effort" in data
+    # DeepSeek V4 Pro can reject thinking: disabled even when Claude Code omits
+    # reasoning_effort, which happens with some sub-agent requests.
     thinking = data.get("thinking", {})
-    if has_reasoning:
-        if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
-            data["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
-    elif isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        pass
-    elif not thinking or (isinstance(thinking, dict) and thinking.get("type") != "enabled"):
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
         data["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
 
     messages = data.get("messages", [])
@@ -133,14 +160,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _send_json(self, status, payload):
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        self.wfile.flush()
+
+    def _send_upstream_error(self, status, raw):
+        try:
+            json.loads(raw)
+            body = raw
+        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+            body = json.dumps({
+                "error": {
+                    "type": "upstream_error",
+                    "message": text[:2000] or f"upstream returned HTTP {status}"
+                }
+            }).encode()
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def _forward(self):
         try:
             self._forward_inner()
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] ERR: {type(e).__name__}: {e}", flush=True)
             try:
-                self.send_response(502)
-                self.end_headers()
+                self._send_json(502, {
+                    "error": {
+                        "type": "proxy_error",
+                        "message": str(e)
+                    }
+                })
             except Exception:
                 pass
 
@@ -163,21 +223,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() in FORWARD_HEADERS}
         headers["Host"] = urlparse(DEEPSEEK_URL).hostname
 
-        # Force stream for messages
-        is_stream = (isinstance(data, dict) and
-                     (data.get("stream", False) or
-                      self.path.rstrip("/").endswith("/messages")))
+        # Only use SSE when the client explicitly requested stream=true.
+        # Forcing /messages into SSE makes non-stream Claude Code calls fail
+        # with "Failed to parse JSON".
+        is_stream = isinstance(data, dict) and data.get("stream", False)
 
         if is_stream:
             self._handle_stream(body, headers)
             return
 
-        parsed = urlparse(DEEPSEEK_URL + self.path)
-        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=300)
+        parsed = urlparse(_upstream_url(self.path))
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=300)
+        else:
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=300)
         try:
             conn.request("POST", parsed.path, body=body, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
+            if resp.status >= 400:
+                print(f"[{time.strftime('%H:%M:%S')}] ERR {resp.status}: {raw[:500]}", flush=True)
+                self._send_upstream_error(resp.status, raw)
+                return
             try:
                 j = json.loads(raw)
                 j, _ = patch_response(j)
@@ -195,8 +262,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _handle_stream(self, body, forward_headers):
-        parsed = urlparse(DEEPSEEK_URL + self.path)
-        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=300)
+        parsed = urlparse(_upstream_url(self.path))
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=300)
+        else:
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=300)
         try:
             conn.request("POST", parsed.path, body=body, headers=forward_headers)
             resp = conn.getresponse()
@@ -205,12 +275,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if resp.status != 200:
                 err = resp.read()
-                self.send_response(resp.status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(err)))
-                self.end_headers()
-                self.wfile.write(err)
-                self.wfile.flush()
+                self._send_upstream_error(resp.status, err)
                 return
 
             self.send_response(200)
@@ -273,11 +338,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9194
-    server = HTTPServer(("127.0.0.1", port), ProxyHandler)
-    print(f"[proxy-http] http://127.0.0.1:{port} -> {DEEPSEEK_URL}", flush=True)
-    print(f"[proxy-http] Set ANTHROPIC_BASE_URL=http://127.0.0.1:{port}", flush=True)
-    server.serve_forever()
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9191
+    while True:
+        try:
+            server = HTTPServer(("127.0.0.1", port), ProxyHandler)
+            print(f"[proxy-http] http://127.0.0.1:{port} -> {DEEPSEEK_URL}", flush=True)
+            print(f"[proxy-http] Set ANTHROPIC_BASE_URL=http://127.0.0.1:{port}", flush=True)
+            print("[proxy-http] Auto-restart enabled - will recover from crashes", flush=True)
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[proxy-http] Shutting down.")
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            break
+        except OSError as e:
+            if "10048" in str(e) or "Address already in use" in str(e):
+                print(f"[proxy-http] Port {port} already in use, retrying in 5s...", flush=True)
+                time.sleep(5)
+                continue
+            print(f"[proxy-http] OSError: {e}, restarting in 3s...", flush=True)
+            time.sleep(3)
+        except Exception as e:
+            print(f"[proxy-http] Crash: {type(e).__name__}: {e}, restarting in 3s...", flush=True)
+            time.sleep(3)
 
 if __name__ == "__main__":
     main()

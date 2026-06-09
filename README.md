@@ -4,9 +4,9 @@
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square)
 ![License](https://img.shields.io/github/license/HiChat-fog/claude-deepseek-proxy?style=flat-square)
 
-**Enable thinking mode for Claude Code with DeepSeek V4 Pro** — a crash-resistant HTTPS proxy that fixes the "thinking block must be passed back" error. Set it up once, forget about it.
+**Enable thinking mode for Claude Code with DeepSeek V4 Pro** — a crash-resistant HTTP proxy that fixes the "thinking block must be passed back" error. Set it up once, forget about it.
 
-**让 Claude Code + DeepSeek V4 Pro 的 thinking 模式真正能用** — 防崩+自动重启的 HTTPS proxy，解决 "thinking block must be passed back" 报错。设一次，再也不用管。
+**让 Claude Code + DeepSeek V4 Pro 的 thinking 模式真正能用** — 防崩+自动重启的 HTTP proxy，解决 "thinking block must be passed back" 报错。设一次，再也不用管。
 
 ---
 
@@ -33,7 +33,7 @@ Can't enable it, can't disable it — you're stuck. This proxy fixes that.
 ## How it works / 怎么解决的
 
 ```
-Claude Code  ──HTTPS──▶  Proxy (127.0.0.1:9191)  ──HTTPS──▶  DeepSeek API
+Claude Code  ──HTTP──▶  Proxy (127.0.0.1:9191)  ──HTTPS/HTTP──▶  DeepSeek API
                            │
                            ├─ Request: assistant msg missing thinking blocks?
                            │           Inject them from cache!
@@ -99,28 +99,36 @@ This launches the proxy silently on login. Set it and forget it.
 ### Install dependencies / 装依赖
 
 ```bash
-pip install cryptography
+pip install -r requirements.txt
 ```
 
-### Clone & install cert / clone & 安装证书
+### Clone / clone
 
 ```bash
 git clone https://github.com/HiChat-fog/claude-deepseek-proxy.git
 cd claude-deepseek-proxy
-
-# Generate cert + install to system trust store (one-time setup)
-# 生成证书 + 装到系统信任区（只需跑一次）
-python claude_deepseek_proxy.py --install
 ```
 
 ### Start the proxy / 启动 proxy
 
 ```bash
-# Default port 9191 / 默认 9191 端口
-python claude_deepseek_proxy.py
+# Install the local command / 安装本机命令
+python3 claude_deepseek_proxy_ctl.py install
 
-# Or specify a port / 或者指定端口
-python claude_deepseek_proxy.py 8443
+# Start in the background / 后台启动
+claude-deepseek-proxy start
+
+# Check status / 查看状态
+claude-deepseek-proxy status
+
+# Stop / 关闭
+claude-deepseek-proxy stop
+
+# Restart / 重启
+claude-deepseek-proxy restart
+
+# Logs / 查看日志
+claude-deepseek-proxy logs
 ```
 
 The proxy auto-restarts on crash. If you see `Auto-restart enabled` in the log, you're covered.
@@ -136,42 +144,34 @@ Edit `~/.claude/settings.json`:
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://127.0.0.1:9191",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:9191",
     "ANTHROPIC_AUTH_TOKEN": "your-deepseek-api-key",
-    "ANTHROPIC_MODEL": "DeepSeek-V4-pro[1m]"
+    "ANTHROPIC_MODEL": "DeepSeek-V4-pro[1m]",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "no_proxy": "127.0.0.1,localhost"
   },
   "alwaysThinkingEnabled": true
 }
 ```
 
+Use `http://127.0.0.1:9191`, not `https://127.0.0.1:9191`. `NO_PROXY` prevents local Claude Code requests from being sent through a system HTTP proxy.
+
+使用 `http://127.0.0.1:9191`，不要使用 `https://127.0.0.1:9191`。`NO_PROXY` 用于避免本机 Claude Code 请求被系统 HTTP 代理转发出去。
+
 Restart Claude Code and you're good to go. 重启 Claude Code，搞定。
 
-### Uninstall / 卸载
-
-```bash
-python claude_deepseek_proxy.py --uninstall
-```
-
-Removes the CA cert from trust store and deletes cert files. Clean exit.
-
-删证书、清文件，干干净净。
-
----
-
 ## Environment Variables / 环境变量
+
+All variables can be set via `.env` file (copy `.env.example` first) or via OS environment variables.
+OS environment variables take precedence over `.env`.
+
+所有变量可通过 `.env` 文件（复制 `.env.example`）或系统环境变量设置。
+系统环境变量优先级高于 `.env`。
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEEPSEEK_API_URL` | `https://api.deepseek.com/anthropic` | Upstream API URL / 上游 API 地址 |
-| `THINKING_BUDGET` | `10000` | Thinking token budget / thinking token 预算 |
-
----
-
-## About the Certificate / 关于证书
-
-The proxy generates a self-signed CA certificate and installs it to your system trust store, so Claude Code won't complain about SSL errors over HTTPS. The CA-issued server cert is for `127.0.0.1`, using `IPAddress` in SAN (not `DNSName` — using DNSName for an IP causes hostname mismatch, that's a gotcha).
-
-proxy 会生成一个自签名 CA 证书装到你系统信任区，这样 Claude Code 走 HTTPS 就不会报 SSL 错误。CA 签发的 server 证书给 `127.0.0.1` 用，SAN 用的是 `IPAddress`（不是 `DNSName`，用 DNSName 会 hostname mismatch，这是个坑）。
+| `THINKING_BUDGET` | `4000` | Thinking token budget / thinking token 预算 |
 
 ---
 
@@ -507,22 +507,11 @@ The closest related work is:
 
 ## Troubleshooting / 踩坑记录
 
-### SSL certificate hostname mismatch
-
-The certificate SAN must use `IPAddress` for IP addresses, not `DNSName`. If you hit this, regenerate:
-
-证书 SAN 里 IP 地址必须用 `IPAddress`，不能用 `DNSName`。遇到这个就重新生成：
-
-```bash
-python claude_deepseek_proxy.py --uninstall
-python claude_deepseek_proxy.py --install
-```
-
 ### Proxy not receiving requests / Proxy 收不到请求
 
-Claude Code only connects to `https://` endpoints — it ignores `http://`. Make sure `ANTHROPIC_BASE_URL` is `https://127.0.0.1:PORT`.
+Make sure `ANTHROPIC_BASE_URL` is `http://127.0.0.1:PORT` and that `NO_PROXY` includes `127.0.0.1,localhost`. Without `NO_PROXY`, some environments send local requests through `http_proxy`/`https_proxy`, so the proxy never receives them.
 
-Claude Code 只走 `https://`，`http://` 的 endpoint 它不理。确保 `ANTHROPIC_BASE_URL` 是 `https://127.0.0.1:PORT`。
+确认 `ANTHROPIC_BASE_URL` 是 `http://127.0.0.1:PORT`，并且 `NO_PROXY` 包含 `127.0.0.1,localhost`。如果没有 `NO_PROXY`，有些环境会把本机请求发到 `http_proxy`/`https_proxy`，导致本代理完全收不到请求。
 
 ### 400: thinking cannot be disabled when reasoning_effort is set
 

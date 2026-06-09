@@ -1,5 +1,5 @@
 """
-ClaudeCode-DeepSeek-Proxy
+ClaudeCode-DeepSeek-Proxy (HTTP)
 Fixes thinking block incompatibility between Claude Code + DeepSeek V4 Pro.
 Supports SSE streaming to prevent client-side timeouts during long thinking.
 
@@ -25,8 +25,6 @@ Solution:
   - SSE streaming: Forward SSE events from DeepSeek to Claude Code as they
     arrive, preventing client-side timeouts during long thinking sessions.
   - Auto-restart: Crash-resistant with auto-recovery loop.
-
-One-time setup: run with --install to trust the self-signed cert.
 """
 
 import base64
@@ -43,6 +41,34 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import urllib.error
 import urllib.request
+
+
+def load_dotenv(path: str = ".env"):
+    """Load environment variables from a .env file without external deps.
+
+    Existing OS environment variables are kept and take precedence.
+    Supported lines:
+      KEY=value
+      KEY="value"
+      KEY='value'
+    Lines starting with # are ignored.
+    """
+    dotenv_path = os.path.abspath(path)
+    if not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_dotenv()
 
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/anthropic")
 CERT_DIR = os.path.expanduser("~/.claude-deepseek-proxy")
@@ -66,6 +92,10 @@ _thinking_store = {}  # {hash_of_text: [thinking_blocks]}
 # We track which request IDs have this constraint so we can strip extra
 # tool_use blocks from the response.
 _parallel_disabled = False
+
+
+def _upstream_url(path: str) -> str:
+    return DEEPSEEK_URL.rstrip("/") + path
 
 
 def _hash_text(text: str) -> str:
@@ -112,15 +142,11 @@ def patch_request(data):
             data["stop_sequences"] = filtered
             print(f"[{time.strftime('%H:%M:%S')}] SAFETY-FIX: Removed {removed_count} dangerous stop_sequences (safety refusal truncation prevention)", flush=True)
     # --- Fix thinking mode ---
-    has_reasoning = "reasoning_effort" in data
+    # DeepSeek V4 Pro can reject thinking: disabled even when Claude Code omits
+    # reasoning_effort, which happens with some sub-agent requests.
     thinking = data.get("thinking", {})
 
-    if has_reasoning:
-        if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
-            data["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
-    elif isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        pass
-    elif not thinking or (isinstance(thinking, dict) and thinking.get("type") != "enabled"):
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
         data["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
 
     # --- Fix assistant messages ---
@@ -259,16 +285,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # Suppress default logging; we do our own
 
+    def _send_json(self, status, payload):
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        self.wfile.flush()
+
+    def _send_upstream_error(self, status, raw):
+        try:
+            json.loads(raw)
+            body = raw
+        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+            body = json.dumps({
+                "error": {
+                    "type": "upstream_error",
+                    "message": text[:2000] or f"upstream returned HTTP {status}"
+                }
+            }).encode()
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def _forward(self):
         try:
             self._forward_inner()
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] UNHANDLED: {type(e).__name__}: {e}", flush=True)
             try:
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": f"proxy error: {e}"}).encode())
+                self._send_json(502, {
+                    "error": {
+                        "type": "proxy_error",
+                        "message": str(e)
+                    }
+                })
             except Exception:
                 pass
 
@@ -294,19 +351,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers["Host"] = urlparse(DEEPSEEK_URL).hostname
 
         # --- Streaming detection ---
-        # Claude Code sends stream=true by default. We MUST support SSE streaming
-        # to avoid client-side timeouts during long thinking sessions.
-        # Force stream=true for messages endpoints even if Claude Code didn't set it,
-        # to prevent the old buffered path from causing timeouts on large contexts.
-        is_stream = (isinstance(data, dict) and
-                     (data.get("stream", False) or
-                      self.path.rstrip("/").endswith("/messages")))
+        # Only use SSE when the client explicitly requested stream=true.
+        # Forcing /messages into SSE makes non-stream Claude Code calls fail
+        # with "Failed to parse JSON".
+        is_stream = isinstance(data, dict) and data.get("stream", False)
 
         if is_stream:
             self._handle_stream(body, headers)
             return
 
-        req = urllib.request.Request(DEEPSEEK_URL + self.path, data=body,
+        req = urllib.request.Request(_upstream_url(self.path), data=body,
                                       headers=headers, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=300)
@@ -336,9 +390,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             err = e.read()
             print(f"[{time.strftime('%H:%M:%S')}] ERR {e.code}: {err[:500]}", flush=True)
-            self.send_response(e.code)
-            self.end_headers()
-            self.wfile.write(err)
+            self._send_upstream_error(e.code, err)
 
     def _handle_stream(self, body, forward_headers):
         """Raw pipe: forward SSE bytes from DeepSeek to Claude Code.
@@ -350,7 +402,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         Thinking blocks are cached after the stream completes by scanning
         the accumulated raw data.
         """
-        parsed = urlparse(DEEPSEEK_URL + self.path)
+        parsed = urlparse(_upstream_url(self.path))
         if parsed.scheme == "https":
             conn = http.client.HTTPSConnection(
                 parsed.hostname, parsed.port or 443, timeout=300)
@@ -368,12 +420,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # --- Error response ---
             if resp.status != 200:
                 err_body = resp.read()
-                self.send_response(resp.status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(err_body)))
-                self.end_headers()
-                self.wfile.write(err_body)
-                self.wfile.flush()
+                self._send_upstream_error(resp.status, err_body)
                 return
 
             # --- SSE streaming response ---
@@ -578,30 +625,24 @@ def main():
         return
 
     if "--install" in sys.argv:
+        print("[proxy] HTTP mode does not require a certificate.")
+        print("[proxy] Installing a cert is only needed for the legacy HTTPS mode.")
         ca = generate_cert()
         install_cert(ca)
-        print("[proxy] Cert installed. Run without --install to start proxy.")
+        print("[proxy] Cert installed.")
         return
 
-    if not os.path.exists(CERT_FILE):
-        print("[proxy] No certificate found. Generating and installing...")
-        ca = generate_cert()
-        install_cert(ca)
-
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9191
+    args = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
+    port = int(args[0]) if args else 9191
 
     # Auto-restart loop: if the server crashes, restart it automatically
     while True:
         try:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(CERT_FILE)
-
             server = HTTPServer(("127.0.0.1", port), ProxyHandler)
-            server.socket = ctx.wrap_socket(server.socket, server_side=True)
 
-            print(f"[proxy] https://127.0.0.1:{port} -> {DEEPSEEK_URL}", flush=True)
-            print(f"[proxy] Set ANTHROPIC_BASE_URL=https://127.0.0.1:{port}", flush=True)
-            print("[proxy] Auto-restart enabled — will recover from crashes", flush=True)
+            print(f"[proxy] http://127.0.0.1:{port} -> {DEEPSEEK_URL}", flush=True)
+            print(f"[proxy] Set ANTHROPIC_BASE_URL=http://127.0.0.1:{port}", flush=True)
+            print("[proxy] Auto-restart enabled - will recover from crashes", flush=True)
             server.serve_forever()
         except KeyboardInterrupt:
             print("\n[proxy] Shutting down.")
